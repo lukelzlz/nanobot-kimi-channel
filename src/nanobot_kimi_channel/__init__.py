@@ -71,14 +71,47 @@ def _extract_text_from_blocks(value: dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+class _TextState:
+    __slots__ = ("block_id", "snapshot")
+
+    def __init__(self):
+        self.block_id = "0"
+        self.snapshot = ""
+
+
+class _ReasoningState:
+    __slots__ = ("block_id", "accumulated")
+
+    def __init__(self):
+        self.block_id = "0"
+        self.accumulated = ""
+
+
+class _ToolState:
+    __slots__ = ("tool_call_id", "name", "args", "status", "summary", "resource_links", "block_id")
+
+    def __init__(self, tool_call_id: str, name: str, args: str = ""):
+        self.tool_call_id = tool_call_id
+        self.name = name
+        self.args = args
+        self.status = "running"
+        self.summary = ""
+        self.resource_links: list[dict[str, str]] = []
+        self.block_id = tool_call_id or "0"
+
+
 class _StreamState:
-    __slots__ = ("ws", "block_id", "accumulated", "lock")
+    __slots__ = ("ws", "text", "lock", "reasoning", "started", "tool_states", "resource_link_uris", "reasoning_rotate_pending")
 
     def __init__(self):
         self.ws = None
-        self.block_id = "0"
-        self.accumulated = ""
+        self.text = _TextState()
         self.lock = asyncio.Lock()
+        self.reasoning = None
+        self.started = False
+        self.tool_states: dict[str, _ToolState] = {}
+        self.resource_link_uris: set[str] = set()
+        self.reasoning_rotate_pending = False
 
 
 class _FallbackConfigBase:
@@ -96,6 +129,7 @@ class KimiChannelConfig(_ConfigBase):
     kimiapi_host: str = _DEFAULT_KIMIAPI_HOST
     allow_from: list[str] = ["*"]
     streaming: bool = True
+    stream_reasoning: bool = True
 
     def __init__(self, **kwargs: Any):
         values = {
@@ -104,6 +138,7 @@ class KimiChannelConfig(_ConfigBase):
             "kimiapi_host": _DEFAULT_KIMIAPI_HOST,
             "allow_from": ["*"],
             "streaming": True,
+            "stream_reasoning": True,
         }
         values.update(kwargs)
         super().__init__(**values)
@@ -122,6 +157,7 @@ class KimiChannel(BaseChannel):
         self._bot_token = normalized_config.bot_token
         self._kimiapi_host = normalized_config.kimiapi_host
         self._im_rpc_base = _resolve_im_rpc_base(self._kimiapi_host)
+        self._stream_reasoning = bool(getattr(normalized_config, "stream_reasoning", True))
         self._running = False
         self._chat_map: dict[str, str] = {}
         self._subscribe_task: asyncio.Task | None = None
@@ -142,6 +178,8 @@ class KimiChannel(BaseChannel):
                 data["bot_token"] = data["botToken"]
             if "kimiapiHost" in data and "kimiapi_host" not in data:
                 data["kimiapi_host"] = data["kimiapiHost"]
+            if "streamReasoning" in data and "stream_reasoning" not in data:
+                data["stream_reasoning"] = data["streamReasoning"]
             return KimiChannelConfig(**data)
 
         values = {
@@ -150,6 +188,7 @@ class KimiChannel(BaseChannel):
             "kimiapi_host": getattr(config, "kimiapi_host", getattr(config, "kimiapiHost", _DEFAULT_KIMIAPI_HOST)),
             "allow_from": getattr(config, "allow_from", getattr(config, "allowFrom", ["*"])),
             "streaming": getattr(config, "streaming", True),
+            "stream_reasoning": getattr(config, "stream_reasoning", getattr(config, "streamReasoning", True)),
         }
         return KimiChannelConfig(**values)
 
@@ -161,6 +200,7 @@ class KimiChannel(BaseChannel):
             "kimiapi_host": _DEFAULT_KIMIAPI_HOST,
             "allow_from": ["*"],
             "streaming": True,
+            "stream_reasoning": True,
         }
 
     async def start(self) -> None:
@@ -220,26 +260,63 @@ class KimiChannel(BaseChannel):
             if not ss:
                 return
         async with ss.lock:
-            ss.accumulated += delta
-            frame = {
-                "blockUpdate": {
-                    "op": 1,
-                    "block": {
-                        "id": ss.block_id,
-                        "text": {"content": ss.accumulated},
-                    },
-                }
-            }
+            if not ss.started:
+                await self._start_stream(ss, kimi_chat_id)
+            if metadata:
+                await self._emit_metadata_blocks(ss, metadata)
+            next_snapshot = f"{ss.text.snapshot}{delta}"
+            frame = self._build_progress_frame("text", ss.text.block_id, ss.text.snapshot, next_snapshot)
+            if not frame:
+                return
             try:
                 await ss.ws.send(json.dumps(frame))
+                ss.text.snapshot = next_snapshot
             except Exception as e:
                 self.logger.warning("send_delta ws error: {}", e)
 
     async def send_reasoning_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
-        pass
+        if not self._stream_reasoning:
+            return
+        kimi_chat_id = self._chat_map.get(chat_id)
+        if not kimi_chat_id:
+            return
+        ss = self._streams.get(kimi_chat_id)
+        if not ss or not ss.ws:
+            ss = await self._open_stream(kimi_chat_id)
+            if not ss:
+                return
+        async with ss.lock:
+            if not ss.started:
+                await self._start_stream(ss, kimi_chat_id)
+            if metadata:
+                await self._emit_metadata_blocks(ss, metadata)
+            reasoning = self._ensure_reasoning_state(ss)
+            if ss.reasoning_rotate_pending and not reasoning.accumulated:
+                reasoning.block_id = self._next_block_id("thinking")
+                ss.reasoning_rotate_pending = False
+            next_snapshot = f"{reasoning.accumulated}{delta}"
+            frame = self._build_progress_frame("think", reasoning.block_id, reasoning.accumulated, next_snapshot)
+            if not frame:
+                return
+            try:
+                await ss.ws.send(json.dumps(frame))
+                reasoning.accumulated = next_snapshot
+            except Exception as e:
+                self.logger.warning("send_reasoning_delta ws error: {}", e)
 
     async def send_reasoning_end(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
-        pass
+        if not self._stream_reasoning:
+            return
+        kimi_chat_id = self._chat_map.get(chat_id)
+        if not kimi_chat_id:
+            return
+        ss = self._streams.get(kimi_chat_id)
+        if not ss or not ss.ws:
+            return
+        async with ss.lock:
+            if hasattr(ss, "reasoning"):
+                ss.reasoning = None
+                ss.reasoning_rotate_pending = True
 
     def _im_headers(self, content_type: str = "application/json; charset=utf-8") -> dict[str, str]:
         return {
@@ -423,11 +500,7 @@ class KimiChannel(BaseChannel):
                 additional_headers={_AUTH_HEADER: self._bot_token},
                 close_timeout=5,
             )
-            await ws.send(json.dumps({"chatId": kimi_chat_id}))
-            await ws.send(json.dumps({"ping": {}}))
             ss.ws = ws
-            ss.block_id = "0"
-            ss.accumulated = ""
             self._streams[kimi_chat_id] = ss
             self.logger.info("opened SendMessageStream ws for chat={}", kimi_chat_id)
             return ss
@@ -440,7 +513,8 @@ class KimiChannel(BaseChannel):
         if not ss or not ss.ws:
             return
         try:
-            await ss.ws.send(json.dumps({"end": {}}))
+            if ss.started:
+                await ss.ws.send(json.dumps(self._build_end_frame()))
             await asyncio.wait_for(ss.ws.wait_closed(), timeout=3)
         except Exception:
             pass
@@ -478,3 +552,153 @@ class KimiChannel(BaseChannel):
         header[0] = 0
         header[1:5] = len(body).to_bytes(4, "big")
         return bytes(header) + body
+
+    @staticmethod
+    def _build_stream_start_frame(chat_id: str) -> dict[str, Any]:
+        return {"chatId": chat_id}
+
+    @staticmethod
+    def _build_end_frame() -> dict[str, Any]:
+        return {"end": {}}
+
+    @staticmethod
+    def _build_text_block_frame(block_id: str, content: str, append: bool) -> dict[str, Any]:
+        return {
+            "blockUpdate": {
+                "op": 2 if append else 1,
+                "mask": {"paths": ["block.text.content"]},
+                "block": {
+                    "id": block_id,
+                    "text": {"content": content},
+                },
+            }
+        }
+
+    @staticmethod
+    def _build_thinking_block_frame(block_id: str, content: str, append: bool) -> dict[str, Any]:
+        return {
+            "blockUpdate": {
+                "op": 2 if append else 1,
+                "mask": {"paths": ["block.think.content"]},
+                "block": {
+                    "id": block_id,
+                    "think": {"content": content},
+                },
+            }
+        }
+
+    @staticmethod
+    def _ensure_reasoning_state(ss: _StreamState) -> _ReasoningState:
+        reasoning = getattr(ss, "reasoning", None)
+        if reasoning is None:
+            reasoning = _ReasoningState()
+            ss.reasoning = reasoning
+        return reasoning
+
+    async def _emit_metadata_blocks(self, ss: _StreamState, metadata: dict[str, Any]) -> None:
+        tool = metadata.get("tool") if isinstance(metadata, dict) else None
+        resource_links = metadata.get("resource_links") if isinstance(metadata, dict) else None
+        if isinstance(tool, dict):
+            await self._emit_tool_block(ss, tool)
+        if isinstance(resource_links, list):
+            await self._emit_resource_link_blocks(ss, resource_links)
+
+    async def _emit_tool_block(self, ss: _StreamState, tool: dict[str, Any]) -> None:
+        if not ss.ws:
+            return
+        tool_call_id = str(tool.get("id") or tool.get("tool_call_id") or self._next_block_id("tool"))
+        name = str(tool.get("name") or "tool")
+        args_obj = tool.get("args") or tool.get("arguments") or {}
+        args = args_obj if isinstance(args_obj, str) else json.dumps(args_obj, ensure_ascii=False)
+        state = ss.tool_states.get(tool_call_id)
+        if state is None:
+            state = _ToolState(tool_call_id=tool_call_id, name=name, args=args)
+            state.block_id = self._next_block_id("tool")
+            ss.tool_states[tool_call_id] = state
+        state.name = name
+        state.args = args
+        state.status = str(tool.get("status") or state.status or "running")
+        if "summary" in tool and isinstance(tool.get("summary"), str):
+            state.summary = tool["summary"]
+        frame = self._build_tool_block_frame(state)
+        await ss.ws.send(json.dumps(frame))
+
+    async def _emit_resource_link_blocks(self, ss: _StreamState, resource_links: list[Any]) -> None:
+        if not ss.ws:
+            return
+        for item in resource_links:
+            if not isinstance(item, dict):
+                continue
+            uri = str(item.get("uri") or item.get("url") or item.get("downloadUrl") or "").strip()
+            if not uri or uri in ss.resource_link_uris:
+                continue
+            ss.resource_link_uris.add(uri)
+            title = str(item.get("title") or item.get("name") or uri.rsplit("/", 1)[-1] or uri)
+            frame = self._build_resource_link_block_frame(self._next_block_id("resource"), title, uri)
+            await ss.ws.send(json.dumps(frame))
+
+    def _build_tool_block_frame(self, tool: _ToolState) -> dict[str, Any]:
+        is_error = tool.status == "failed"
+        contents = []
+        if tool.status != "running":
+            contents = [{"content": {"text": {"content": tool.summary or ("Tool failed." if is_error else "Tool completed successfully.")}}}]
+        return {
+            "blockUpdate": {
+                "op": 1,
+                "block": {
+                    "id": tool.block_id,
+                    "tool": {
+                        "toolCallId": tool.tool_call_id,
+                        "name": tool.name,
+                        "args": tool.args,
+                        "isError": is_error,
+                        "contents": contents,
+                        "status": 1 if tool.status == "running" else 2,
+                    },
+                },
+            }
+        }
+
+    @staticmethod
+    def _build_resource_link_block_frame(block_id: str, title: str, uri: str) -> dict[str, Any]:
+        return {
+            "blockUpdate": {
+                "op": 1,
+                "block": {
+                    "id": block_id,
+                    "resourceLink": {
+                        "title": title,
+                        "uri": uri,
+                        "downloadUrl": uri,
+                        "etag": "",
+                        "sizeBytes": 0,
+                    },
+                },
+            }
+        }
+
+    @staticmethod
+    def _next_block_id(prefix: str) -> str:
+        return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+    async def _start_stream(self, ss: _StreamState, kimi_chat_id: str) -> None:
+        if ss.started or not ss.ws:
+            return
+        await ss.ws.send(json.dumps(self._build_stream_start_frame(kimi_chat_id)))
+        await ss.ws.send(json.dumps({"ping": {}}))
+        ss.started = True
+
+    def _build_progress_frame(
+        self,
+        lane: str,
+        block_id: str,
+        previous_snapshot: str,
+        next_snapshot: str,
+    ) -> dict[str, Any] | None:
+        if not next_snapshot or next_snapshot == previous_snapshot:
+            return None
+        append = bool(previous_snapshot) and next_snapshot.startswith(previous_snapshot)
+        payload = next_snapshot[len(previous_snapshot):] if append else next_snapshot
+        if lane == "think":
+            return self._build_thinking_block_frame(block_id, payload, append=append)
+        return self._build_text_block_frame(block_id, payload, append=append)
